@@ -568,8 +568,13 @@ constructor(
     ): ListenableFuture<MediaItemsWithStartPosition> =
         scope.future {
             val defaultResult = MediaItemsWithStartPosition(emptyList(), startIndex, startPositionMs)
-            val path = mediaItems.firstOrNull()?.mediaId?.split("/")
-                ?: return@future defaultResult
+            val voiceQuery = mediaItems.firstOrNull()?.requestMetadata?.searchQuery
+
+            val path = if (!voiceQuery.isNullOrBlank()) {
+                listOf(MusicService.SEARCH, voiceQuery, "")
+            } else {
+                mediaItems.firstOrNull()?.mediaId?.split("/")
+            } ?: return@future defaultResult
 
             when (path.firstOrNull()) {
                 MusicService.SONG -> {
@@ -786,12 +791,14 @@ constructor(
         ).build()
 
     private fun Song.toMediaItem(path: String, isPlayable: Boolean = true, isBrowsable: Boolean = false): MediaItem {
-        val artworkUri = song.thumbnailUrl?.let {
-            val snapshot = context.imageLoader.diskCache?.openSnapshot(it)
-            if (snapshot != null) {
-                snapshot.use { snapshot -> snapshot.data.toFile().toUri() }
-            } else {
-                it.toUri()
+        val artworkBytes = song.thumbnailUrl?.let { url ->
+            val request = coil3.request.ImageRequest.Builder(context)
+                .data(url)
+                .build()
+            context.imageLoader.enqueue(request)
+
+            context.imageLoader.diskCache?.openSnapshot(url)?.use { snapshot ->
+                snapshot.data.toFile().readBytes()
             }
         }
 
@@ -804,7 +811,7 @@ constructor(
                     .setTitle(song.title)
                     .setSubtitle(artists.joinToString { it.name })
                     .setArtist(artists.joinToString { it.name })
-                    .setArtworkUri(artworkUri)
+                    .setArtworkData(artworkBytes, MediaMetadata.PICTURE_TYPE_ILLUSTRATION)
                     .setIsPlayable(isPlayable)
                     .setIsBrowsable(isBrowsable)
                     .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)

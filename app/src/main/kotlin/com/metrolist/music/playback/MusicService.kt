@@ -28,10 +28,13 @@ import android.media.audiofx.LoudnessEnhancer
 import android.net.ConnectivityManager
 import android.os.Binder
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.ServiceCompat
 import androidx.core.content.getSystemService
 import androidx.core.net.toUri
 import androidx.datastore.preferences.core.edit
@@ -74,8 +77,11 @@ import androidx.media3.session.CommandButton
 import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.MediaController
 import androidx.media3.session.MediaLibraryService
+import androidx.media3.session.MediaNotification
 import androidx.media3.session.MediaSession
+import androidx.media3.session.MediaSessionService
 import androidx.media3.session.SessionToken
+import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.MoreExecutors
 import com.metrolist.innertube.YouTube
 import com.metrolist.innertube.models.SongItem
@@ -90,6 +96,7 @@ import com.metrolist.music.constants.AudioQualityKey
 import com.metrolist.music.constants.AutoDownloadOnLikeKey
 import com.metrolist.music.constants.AutoLoadMoreKey
 import com.metrolist.music.constants.AutoSkipNextOnErrorKey
+import com.metrolist.music.constants.AutoplayKey
 import com.metrolist.music.constants.CrossfadeDurationKey
 import com.metrolist.music.constants.CrossfadeEnabledKey
 import com.metrolist.music.constants.CrossfadeGaplessKey
@@ -136,6 +143,7 @@ import com.metrolist.music.constants.ShufflePlaylistFirstKey
 import com.metrolist.music.constants.SimilarContent
 import com.metrolist.music.constants.SkipSilenceInstantKey
 import com.metrolist.music.constants.SkipSilenceKey
+import com.metrolist.music.constants.StopMusicOnTaskClearKey
 import com.metrolist.music.db.MusicDatabase
 import com.metrolist.music.db.entities.Event
 import com.metrolist.music.db.entities.FormatEntity
@@ -376,6 +384,9 @@ class MusicService :
     private var lastPlaybackSpeed = 1.0f
     private var discordUpdateJob: kotlinx.coroutines.Job? = null
 
+    @Volatile
+    private var latestMediaNotification: Notification? = null
+
     private var scrobbleManager: ScrobbleManager? = null
 
     val automixItems = MutableStateFlow<List<MediaItem>>(emptyList())
@@ -459,58 +470,25 @@ class MusicService :
         super.onCreate()
         isRunning = true
 
+        setListener(
+            object : MediaSessionService.Listener {
+                override fun onForegroundServiceStartNotAllowedException() {
+                    handleForegroundServiceStartNotAllowed(null)
+                }
+            },
+        )
+
         // Player rediness reset to false
         playerInitialized.value = false
 
         // 3. Connect the processor to the service
         // handled in createExoPlayer
 
-        try {
-            val nm = getSystemService(NotificationManager::class.java)
-            nm?.createNotificationChannel(
-                NotificationChannel(
-                    CHANNEL_ID,
-                    getString(R.string.music_player),
-                    NotificationManager.IMPORTANCE_LOW,
-                ),
-            )
-            val pending =
-                PendingIntent.getActivity(
-                    this,
-                    0,
-                    Intent(this, MainActivity::class.java),
-                    PendingIntent.FLAG_IMMUTABLE,
-                )
-            val notification: Notification =
-                NotificationCompat
-                    .Builder(this, CHANNEL_ID)
-                    .setContentTitle(getString(R.string.music_player))
-                    .setContentText("")
-                    .setSmallIcon(R.drawable.small_icon)
-                    .setContentIntent(pending)
-                    .setOngoing(true)
-                    .build()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(
-                    NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
-                )
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
-            }
-        } catch (e: Exception) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                e is ForegroundServiceStartNotAllowedException
-            ) {
-                Timber.tag(TAG).w("Foreground service start not allowed (likely app in background)")
-            } else {
-                Timber.tag(TAG).e(e, "Failed to create foreground notification")
-                reportException(e)
-            }
+        if (!ensureStartedAsForegroundOrStop()) {
+            return
         }
 
-        setMediaNotificationProvider(
+        val defaultMediaNotificationProvider =
             DefaultMediaNotificationProvider(
                 this,
                 { NOTIFICATION_ID },
@@ -518,6 +496,49 @@ class MusicService :
                 R.string.music_player,
             ).apply {
                 setSmallIcon(R.drawable.small_icon)
+            }
+
+        setMediaNotificationProvider(
+            object : MediaNotification.Provider {
+                override fun createNotification(
+                    mediaSession: MediaSession,
+                    mediaButtonPreferences: ImmutableList<CommandButton>,
+                    actionFactory: MediaNotification.ActionFactory,
+                    onNotificationChangedCallback: MediaNotification.Provider.Callback,
+                ): MediaNotification {
+                    val trackingCallback =
+                        MediaNotification.Provider.Callback { notification ->
+                            latestMediaNotification = notification.notification
+                            Handler(Looper.getMainLooper()).post {
+                                runCatching {
+                                    NotificationManagerCompat
+                                        .from(this@MusicService)
+                                        .notify(notification.notificationId, notification.notification)
+                                }.onFailure { error ->
+                                    Timber.tag(TAG).w(error, "Failed to post async media notification update")
+                                }
+                            }
+                        }
+
+                    return defaultMediaNotificationProvider
+                        .createNotification(
+                            mediaSession,
+                            mediaButtonPreferences,
+                            actionFactory,
+                            trackingCallback,
+                        ).also { mediaNotification ->
+                            latestMediaNotification = mediaNotification.notification
+                        }
+                }
+
+                override fun handleCustomCommand(
+                    session: MediaSession,
+                    action: String,
+                    extras: Bundle,
+                ): Boolean = defaultMediaNotificationProvider.handleCustomCommand(session, action, extras)
+
+                override fun getNotificationChannelInfo(): MediaNotification.Provider.NotificationChannelInfo =
+                    defaultMediaNotificationProvider.notificationChannelInfo
             },
         )
         player = createExoPlayer()
@@ -1709,9 +1730,14 @@ class MusicService :
                 val nextBlock = (insertIndex until (insertIndex + items.size)).toList()
                 val finalOrder = IntArray(size)
                 var pos = 0
+                prevList
+                    .filter { it !in newIndices }
+                    .forEach { if (it in 0 until size) finalOrder[pos++] = it }
                 finalOrder[pos++] = currentIndex
                 nextBlock.forEach { if (it in 0 until size) finalOrder[pos++] = it }
-                existingOrder.forEach { if (pos < size) finalOrder[pos++] = it }
+                orderAfter
+                    .filter { it !in newIndices }
+                    .forEach { if (pos < size) finalOrder[pos++] = it }
 
                 // Fill any missing indices (safety) to ensure a full permutation
                 if (pos < size) {
@@ -1832,14 +1858,9 @@ class MusicService :
                 return@launch
             }
 
-            database.query {
-                insert(
-                    com.metrolist.music.db.entities.PlaylistSongMap(
-                        playlistId = targetPlaylistId,
-                        songId = currentSong.id,
-                        position = Int.MAX_VALUE,
-                    ),
-                )
+            val targetPlaylist = database.playlist(targetPlaylistId).first()
+            if (targetPlaylist != null) {
+                database.addSongsToPlaylist(targetPlaylist, listOf(currentSong.id to null), prepend = true)
             }
         }
     }
@@ -2130,13 +2151,39 @@ class MusicService :
     override fun onPlaybackStateChanged(
         @Player.State playbackState: Int,
     ) {
-        // Force Repeat All if the player ignored it and ended playback
+        // Handle autoplay - skip to next song when playback ends
         if (playbackState == Player.STATE_ENDED) {
+            // Check sleep timer guard - don't autoplay/repeat if sleep timer will pause
+            if (sleepTimer.isActive && sleepTimer.pauseWhenSongEnd) {
+                return
+            }
+
             val repeatMode = runBlocking { dataStore.get(RepeatModeKey, REPEAT_MODE_OFF) }
+
+            // Handle Repeat All mode
             if (repeatMode == REPEAT_MODE_ALL && player.mediaItemCount > 0) {
                 player.seekTo(0, 0)
                 player.prepare()
                 player.play()
+                return
+            }
+
+            // Handle Repeat One mode - restart current song
+            if (repeatMode == REPEAT_MODE_ONE) {
+                player.seekTo(player.currentMediaItemIndex, 0)
+                player.prepare()
+                player.play()
+                return
+            }
+
+            // Handle autoplay - check if there's a next item to play
+            val autoplay = runBlocking { dataStore.get(AutoplayKey, true) }
+            if (autoplay && player.hasNextMediaItem()) {
+                player.seekToNextMediaItem()
+                player.prepare()
+                if (castConnectionHandler?.isCasting?.value != true) {
+                    player.play()
+                }
             }
         }
 
@@ -2783,9 +2830,8 @@ class MusicService :
                 performAggressiveCacheClear(mediaId)
                 delay(RETRY_DELAY_MS)
 
-                val currentPosition = player.currentPosition
                 val currentIndex = player.currentMediaItemIndex
-                player.seekTo(currentIndex, currentPosition)
+                player.stop()
                 player.prepare()
 
                 Timber.tag(TAG).d("Retrying playback for $mediaId after generic IO error")
@@ -2796,7 +2842,11 @@ class MusicService :
      * Handles final failure when all recovery attempts have been exhausted.
      */
     private fun handleFinalFailure() {
-        if (dataStore.get(AutoSkipNextOnErrorKey, false)) {
+        val autoSkipOnError = dataStore.get(AutoSkipNextOnErrorKey, false)
+        val autoplay = dataStore.get(AutoplayKey, true)
+        val canAdvance = player.hasNextMediaItem()
+
+        if (autoSkipOnError || (autoplay && canAdvance)) {
             Timber.tag(TAG).d("All recovery attempts exhausted, auto-skipping to next track")
             skipOnError()
         } else {
@@ -2849,6 +2899,24 @@ class MusicService :
                                                 .header("Proxy-Authorization", auth)
                                                 .build()
                                         } ?: response.request
+                                    }.addInterceptor { chain ->
+                                        var request = chain.request()
+                                        if (request.url.queryParameter(PRIVATE_STREAM_MARKER) != null) {
+                                            val cleanUrl =
+                                                request.url
+                                                    .newBuilder()
+                                                    .removeAllQueryParameters(PRIVATE_STREAM_MARKER)
+                                                    .build()
+                                            val builder = request.newBuilder().url(cleanUrl)
+                                            val host = cleanUrl.host
+                                            if (host == "youtube.com" || host.endsWith(".youtube.com") ||
+                                                host.endsWith(".googlevideo.com")
+                                            ) {
+                                                YouTube.cookie?.let { builder.header("Cookie", it) }
+                                            }
+                                            request = builder.build()
+                                        }
+                                        chain.proceed(request)
                                     }.build(),
                             ),
                         ),
@@ -2978,10 +3046,12 @@ class MusicService :
             }
 
             Timber.tag("MusicService").i("FETCHING STREAM: $mediaId | quality=$audioQuality")
+            val isUploaded = database.getSongByIdBlocking(mediaId)?.song?.isUploaded == true
             val playbackData =
                 runBlocking(Dispatchers.IO) {
                     YTPlayerUtils.playerResponseForPlayback(
                         mediaId,
+                        isUploadedHint = isUploaded,
                         audioQuality = audioQuality,
                         connectivityManager = connectivityManager,
                     )
@@ -3058,9 +3128,19 @@ class MusicService :
 
                 val streamUrl = nonNullPlayback.streamUrl
 
+                // For privately-owned tracks, mark the URL so the interceptor attaches auth cookies
+                val finalUrl =
+                    if (nonNullPlayback.isPrivatelyOwned) {
+                        val sep = if ("?" in streamUrl) "&" else "?"
+                        "${streamUrl}${sep}${PRIVATE_STREAM_MARKER}=1"
+                    } else {
+                        streamUrl
+                    }
+
                 songUrlCache[mediaId] =
-                    streamUrl to System.currentTimeMillis() + (nonNullPlayback.streamExpiresInSeconds * 1000L)
-                return@Factory dataSpec.withUri(streamUrl.toUri()).subrange(dataSpec.uriPositionOffset, CHUNK_LENGTH)
+                    finalUrl to System.currentTimeMillis() + (nonNullPlayback.streamExpiresInSeconds * 1000L)
+
+                return@Factory dataSpec.withUri(finalUrl.toUri()).subrange(dataSpec.uriPositionOffset, CHUNK_LENGTH)
             }
         }
     }
@@ -3221,8 +3301,106 @@ class MusicService :
         }
     }
 
+    /**
+     * [Context.startForegroundService] requires [startForeground] to succeed quickly. If we cannot
+     * enter the foreground state, stop immediately so the system does not ANR the app process.
+     */
+    private fun ensureStartedAsForegroundOrStop(): Boolean =
+        startForegroundSafely(
+            notification = createFallbackForegroundNotification(),
+            deniedMessage = "Foreground service start not allowed; stopping service to avoid ANR",
+            failureMessage = "Failed to enter foreground; stopping service to avoid ANR",
+        )
+
+    private fun ensureForegroundWithLatestNotificationOrStop(): Boolean =
+        startForegroundSafely(
+            notification = latestMediaNotification ?: createFallbackForegroundNotification(),
+            deniedMessage = "Foreground promotion denied during notification update; stopping service",
+            failureMessage = "Failed to promote service during notification update; stopping service",
+            stopOnFailure = true,
+        )
+
+    private fun tryEnsureForegroundWithLatestNotification(): Boolean =
+        startForegroundSafely(
+            notification = latestMediaNotification ?: createFallbackForegroundNotification(),
+            deniedMessage = "Foreground promotion denied during notification update",
+            failureMessage = "Failed to promote service during notification update",
+            stopOnFailure = false,
+        )
+
+    private fun ensureForegroundChannelExists() {
+        val nm = getSystemService(NotificationManager::class.java)
+        nm?.createNotificationChannel(
+            NotificationChannel(
+                CHANNEL_ID,
+                getString(R.string.music_player),
+                NotificationManager.IMPORTANCE_LOW,
+            ),
+        )
+    }
+
+    private fun createFallbackForegroundNotification(): Notification {
+        ensureForegroundChannelExists()
+        val pending =
+            PendingIntent.getActivity(
+                this,
+                0,
+                Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_IMMUTABLE,
+            )
+        return NotificationCompat
+            .Builder(this, CHANNEL_ID)
+            .setContentTitle(getString(R.string.music_player))
+            .setContentText("")
+            .setSmallIcon(R.drawable.small_icon)
+            .setContentIntent(pending)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun startForegroundSafely(
+        notification: Notification,
+        deniedMessage: String,
+        failureMessage: String,
+        stopOnFailure: Boolean = true,
+    ): Boolean =
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            true
+        } catch (e: ForegroundServiceStartNotAllowedException) {
+            Timber.tag(TAG).w(e, deniedMessage)
+            if (stopOnFailure) {
+                stopSelf()
+            }
+            false
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, failureMessage)
+            reportException(e)
+            if (stopOnFailure) {
+                stopSelf()
+            }
+            false
+        }
+
     override fun onDestroy() {
         isRunning = false
+
+        if (!::player.isInitialized) {
+            try {
+                scope.cancel()
+            } catch (_: Exception) {
+            }
+            super.onDestroy()
+            return
+        }
 
         // Save episode position before destroying
         val currentMetadata = player.currentMediaItem?.metadata
@@ -3266,16 +3444,76 @@ class MusicService :
     override fun onBind(intent: Intent?) = super.onBind(intent) ?: binder
 
     override fun onTaskRemoved(rootIntent: Intent?) {
+        if (dataStore.get(StopMusicOnTaskClearKey, false)) {
+            if (!::player.isInitialized) {
+                stopSelf()
+                return
+            }
+            // Remote playback (Cast) is independent of the local ExoPlayer; ending the session
+            // is required or audio keeps playing on the Cast device.
+            runCatching {
+                if (castConnectionHandler?.isCasting?.value == true) {
+                    castConnectionHandler?.disconnect()
+                }
+                player.stop()
+                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+                // Media3: coordinates notification/foreground teardown and stopSelf; required when
+                // playback was ongoing (default super.onTaskRemoved keeps the service alive).
+                pauseAllPlayersAndStopSelf()
+            }.onFailure { e ->
+                Timber.tag(TAG).e(e, "Failed to stop playback on task clear")
+                runCatching { pauseAllPlayersAndStopSelf() }.onFailure { stopSelf() }
+            }
+            return
+        }
         super.onTaskRemoved(rootIntent)
+        // User removed the task while paused: drop foreground promotion so the process can idle.
+        // Queue/state remain persisted; opening the app restores playback as usual.
+        if (::player.isInitialized && !player.isPlaying) {
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_DETACH)
+        }
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo) = mediaSession
+
+    override fun onUpdateNotification(
+        session: MediaSession,
+        startInForegroundRequired: Boolean,
+    ) {
+        try {
+            // Pass startInForegroundRequired through unchanged so Media3 manages the
+            // foreground service lifecycle itself. Overriding it to `false` and promoting
+            // manually causes Media3 to demote the service on every notification update
+            // (track change, metadata refresh, etc.); the subsequent manual re-promotion is
+            // denied while backgrounded on Android 12+ (mAllowStartForeground=false), which
+            // ends background playback mid-song after autoplay transitions.
+            // Media3 1.10.0 catches ForegroundServiceStartNotAllowedException internally in
+            // onUpdateNotificationInternal, so the 1.7.x crash-workaround is no longer
+            // needed; the try/catch below is kept as belt-and-suspenders defense.
+            super.onUpdateNotification(session, startInForegroundRequired)
+        } catch (e: ForegroundServiceStartNotAllowedException) {
+            handleForegroundServiceStartNotAllowed(e)
+        } catch (e: IllegalStateException) {
+            if (isForegroundServiceStartNotAllowedException(e)) {
+                handleForegroundServiceStartNotAllowed(e)
+            } else {
+                throw e
+            }
+        }
+    }
 
     override fun onStartCommand(
         intent: Intent?,
         flags: Int,
         startId: Int,
     ): Int {
+        val requiresForegroundPromotion =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                (intent?.action == null || intent.action == ACTION_ALARM_TRIGGER)
+        if (requiresForegroundPromotion && !ensureForegroundWithLatestNotificationOrStop()) {
+            return START_NOT_STICKY
+        }
+
         when (intent?.action) {
             ACTION_ALARM_TRIGGER -> {
                 handleAlarmTrigger(intent)
@@ -3397,6 +3635,39 @@ class MusicService :
             }
         }
     }
+
+    private fun handleForegroundServiceStartNotAllowed(error: Throwable?) {
+        if (error != null) {
+            Timber.tag(TAG).w(error, "Foreground service start denied during notification update")
+        } else {
+            Timber.tag(TAG).w("Foreground service start denied by MediaSessionService listener")
+        }
+
+        if (tryEnsureForegroundWithLatestNotification()) {
+            return
+        }
+
+        if (!::player.isInitialized) {
+            stopSelf()
+            return
+        }
+
+        if (player.isPlaying) {
+            Timber.tag(TAG).w("Keeping playback alive after denied foreground restart request")
+            return
+        }
+
+        runCatching {
+            pauseAllPlayersAndStopSelf()
+        }.onFailure {
+            Timber.tag(TAG).w(it, "Failed to stop service after foreground start denial")
+            stopSelf()
+        }
+    }
+
+    private fun isForegroundServiceStartNotAllowedException(error: IllegalStateException): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            error.javaClass.name == ForegroundServiceStartNotAllowedException::class.java.name
 
     /**
      * Updates all app widgets with current playback state
@@ -3711,6 +3982,7 @@ class MusicService :
         private const val MIN_GAIN_MB = -1500 // Minimum gain in millibels (-15 dB)
 
         private const val TAG = "MusicService"
+        private const val PRIVATE_STREAM_MARKER = "_metrolist_private"
 
         @Volatile
         var isRunning = false

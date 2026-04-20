@@ -6,6 +6,10 @@
 package com.metrolist.music.ui.menu
 
 import android.content.Context
+import android.content.Intent
+import android.media.audiofx.AudioEffect
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import android.content.res.Configuration
 import android.widget.Toast
 import androidx.annotation.DrawableRes
@@ -47,7 +51,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -69,6 +73,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.net.toUri
+import androidx.media3.common.C
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.exoplayer.offline.Download
 import androidx.media3.exoplayer.offline.DownloadRequest
@@ -81,6 +86,7 @@ import com.metrolist.music.LocalListenTogetherManager
 import com.metrolist.music.LocalPlayerConnection
 import com.metrolist.music.R
 import com.metrolist.music.constants.ListItemHeight
+import com.metrolist.music.constants.VarispeedKey
 import com.metrolist.music.listentogether.ConnectionState
 import com.metrolist.music.listentogether.ListenTogetherEvent
 import com.metrolist.music.models.MediaMetadata
@@ -112,7 +118,7 @@ fun PlayerMenu(
     val context = LocalContext.current
     val database = LocalDatabase.current
     val playerConnection = LocalPlayerConnection.current ?: return
-    val playerVolume = playerConnection.service.playerVolume.collectAsState()
+    val playerVolume = playerConnection.service.playerVolume.collectAsStateWithLifecycle()
 
     // Cast state for volume control - safely access castConnectionHandler to prevent crashes
     val castHandler =
@@ -123,16 +129,18 @@ fun PlayerMenu(
                 null
             }
         }
-    val isCasting by castHandler?.isCasting?.collectAsState() ?: remember { mutableStateOf(false) }
-    val castVolume by castHandler?.castVolume?.collectAsState() ?: remember { mutableFloatStateOf(1f) }
-    val castDeviceName by castHandler?.castDeviceName?.collectAsState() ?: remember { mutableStateOf<String?>(null) }
+    val isCasting by castHandler?.isCasting?.collectAsStateWithLifecycle() ?: remember { mutableStateOf(false) }
+    val castVolume by castHandler?.castVolume?.collectAsStateWithLifecycle() ?: remember { mutableFloatStateOf(1f) }
+    val castDeviceName by castHandler?.castDeviceName?.collectAsStateWithLifecycle() ?: remember { mutableStateOf<String?>(null) }
 
-    val librarySong by database.song(mediaMetadata.id).collectAsState(initial = null)
+    val varispeedMode by rememberPreference(VarispeedKey, defaultValue = false)
+
+    val librarySong by database.song(mediaMetadata.id).collectAsStateWithLifecycle(initialValue = null)
     val coroutineScope = rememberCoroutineScope()
 
     val download by LocalDownloadUtil.current
         .getDownload(mediaMetadata.id)
-        .collectAsState(initial = null)
+        .collectAsStateWithLifecycle(initialValue = null)
 
     val artists =
         remember(mediaMetadata.artists) {
@@ -148,10 +156,14 @@ fun PlayerMenu(
     }
 
     val listenTogetherManager = LocalListenTogetherManager.current
-    val listenTogetherRoleState = listenTogetherManager?.role?.collectAsState(initial = com.metrolist.music.listentogether.RoomRole.NONE)
+    val listenTogetherRoleState = listenTogetherManager?.role?.collectAsStateWithLifecycle(initialValue = com.metrolist.music.listentogether.RoomRole.NONE)
     val isListenTogetherGuest = listenTogetherRoleState?.value == com.metrolist.music.listentogether.RoomRole.GUEST
-    val pendingSuggestions by listenTogetherManager?.pendingSuggestions?.collectAsState(initial = emptyList())
+    val pendingSuggestions by listenTogetherManager?.pendingSuggestions?.collectAsStateWithLifecycle(initialValue = emptyList())
         ?: remember { mutableStateOf(emptyList()) }
+
+    val systemEqLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { }
 
     AddToPlaylistDialog(
         isVisible = showChoosePlaylistDialog,
@@ -220,6 +232,16 @@ fun PlayerMenu(
         )
     }
 
+    var showSpeedDialog by rememberSaveable {
+        mutableStateOf(false)
+    }
+
+    if (showSpeedDialog) {
+        SpeedDialog(
+            onDismiss = { showSpeedDialog = false },
+        )
+    }
+
     if (isQueueTrigger != true) {
         Column(
             modifier =
@@ -253,18 +275,40 @@ fun PlayerMenu(
                 }
             }
 
-            VolumeSlider(
-                value = if (isCasting) castVolume else playerVolume.value,
-                onValueChange = { volume ->
-                    if (isCasting) {
-                        castHandler?.setVolume(volume)
-                    } else {
-                        playerConnection.service.playerVolume.value = volume
-                    }
-                },
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth(),
-                accentColor = MaterialTheme.colorScheme.primary,
-            )
+            ) {
+                FilledTonalButton(
+                    onClick = {
+                        navController.navigate("equalizer")
+                        onDismiss()
+                    },
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                    modifier = Modifier.height(40.dp),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.equalizer),
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("EQ", style = MaterialTheme.typography.labelMedium)
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                VolumeSlider(
+                    value = if (isCasting) castVolume else playerVolume.value,
+                    onValueChange = { volume ->
+                        if (isCasting) {
+                            castHandler?.setVolume(volume)
+                        } else {
+                            playerConnection.service.playerVolume.value = volume
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                    accentColor = MaterialTheme.colorScheme.primary,
+                )
+            }
         }
     }
 
@@ -655,6 +699,33 @@ fun PlayerMenu(
                             )
                             add(
                                 Material3MenuItemData(
+                                    title = { Text(text = stringResource(R.string.system_equalizer)) },
+                                    description = { Text(text = stringResource(R.string.system_equalizer_desc)) },
+                                    icon = {
+                                        Icon(
+                                            painter = painterResource(R.drawable.graphic_eq),
+                                            contentDescription = null,
+                                            modifier = Modifier.size(24.dp),
+                                        )
+                                    },
+                                    onClick = {
+                                        val audioSessionId = playerConnection.player.audioSessionId
+                                        if (audioSessionId != C.AUDIO_SESSION_ID_UNSET && audioSessionId > 0) {
+                                            val intent = Intent(AudioEffect.ACTION_DISPLAY_AUDIO_EFFECT_CONTROL_PANEL).apply {
+                                                putExtra(AudioEffect.EXTRA_AUDIO_SESSION, audioSessionId)
+                                                putExtra(AudioEffect.EXTRA_PACKAGE_NAME, context.packageName)
+                                                putExtra(AudioEffect.EXTRA_CONTENT_TYPE, AudioEffect.CONTENT_TYPE_MUSIC)
+                                            }
+                                            if (intent.resolveActivity(context.packageManager) != null) {
+                                                systemEqLauncher.launch(intent)
+                                            }
+                                        }
+                                        onDismiss()
+                                    },
+                                ),
+                            )
+                            add(
+                                Material3MenuItemData(
                                     title = { Text(text = stringResource(R.string.advanced)) },
                                     description = { Text(text = stringResource(R.string.advanced_desc)) },
                                     icon = {
@@ -665,7 +736,8 @@ fun PlayerMenu(
                                         )
                                     },
                                     onClick = {
-                                        showPitchTempoDialog = true
+                                        if (!varispeedMode) showPitchTempoDialog = true
+                                        else showSpeedDialog = true
                                     },
                                 ),
                             )
@@ -746,6 +818,58 @@ fun TempoPitchDialog(onDismiss: () -> Unit) {
     )
 }
 
+@Composable
+fun SpeedDialog(onDismiss: () -> Unit) {
+    val playerConnection = LocalPlayerConnection.current ?: return
+    var speed by remember {
+        mutableFloatStateOf(playerConnection.player.playbackParameters.speed)
+    }
+    val updatePlaybackParameters = {
+        playerConnection.player.playbackParameters =
+            PlaybackParameters(speed, speed)
+    }
+    val listenTogetherManager = com.metrolist.music.LocalListenTogetherManager.current
+
+    AlertDialog(
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+        onDismissRequest = onDismiss,
+        title = {
+            Text(stringResource(R.string.speed))
+        },
+        dismissButton = {
+            TextButton(
+                onClick = {
+                    speed = 1f
+                    updatePlaybackParameters()
+                },
+            ) {
+                Text(stringResource(R.string.reset))
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = onDismiss,
+            ) {
+                Text(stringResource(android.R.string.ok))
+            }
+        },
+        text = {
+            Column {
+                ValueAdjuster(
+                    icon = R.drawable.speed,
+                    currentValue = speed,
+                    values = (0..35).map { round((0.25f + it * 0.05f) * 100) / 100 },
+                    onValueUpdate = {
+                        speed = it
+                        updatePlaybackParameters()
+                    },
+                    valueText = { "x$it" },
+                    modifier = Modifier.padding(bottom = 12.dp),
+                )
+            }
+        },
+    )
+}
 @Composable
 fun <T> ValueAdjuster(
     @DrawableRes icon: Int,
@@ -858,11 +982,11 @@ fun ListenTogetherDialog(
         return
     }
 
-    val connectionState by listenTogetherManager.connectionState.collectAsState()
-    val roomState by listenTogetherManager.roomState.collectAsState()
-    val userId by listenTogetherManager.userId.collectAsState()
-    val pendingJoinRequests by listenTogetherManager.pendingJoinRequests.collectAsState()
-    val pendingSuggestions by listenTogetherManager.pendingSuggestions.collectAsState()
+    val connectionState by listenTogetherManager.connectionState.collectAsStateWithLifecycle()
+    val roomState by listenTogetherManager.roomState.collectAsStateWithLifecycle()
+    val userId by listenTogetherManager.userId.collectAsStateWithLifecycle()
+    val pendingJoinRequests by listenTogetherManager.pendingJoinRequests.collectAsStateWithLifecycle()
+    val pendingSuggestions by listenTogetherManager.pendingSuggestions.collectAsStateWithLifecycle()
 
     // Load saved username
     var savedUsername by rememberPreference(com.metrolist.music.constants.ListenTogetherUsernameKey, "")

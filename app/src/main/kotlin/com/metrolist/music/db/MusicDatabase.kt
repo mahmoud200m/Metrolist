@@ -40,15 +40,18 @@ import com.metrolist.music.db.entities.SetVideoIdEntity
 import com.metrolist.music.db.entities.SongAlbumMap
 import com.metrolist.music.db.entities.SongArtistMap
 import com.metrolist.music.db.entities.SongEntity
-import com.metrolist.music.db.entities.SpeedDialItem
 import com.metrolist.music.db.entities.SortedSongAlbumMap
 import com.metrolist.music.db.entities.SortedSongArtistMap
+import com.metrolist.music.db.entities.SpeedDialItem
 import com.metrolist.music.extensions.toSQLiteQuery
 import timber.log.Timber
+import java.io.File
+import java.text.SimpleDateFormat
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneOffset
 import java.util.Date
+import java.util.Locale
 
 class MusicDatabase(
     private val delegate: InternalDatabase,
@@ -108,14 +111,14 @@ class MusicDatabase(
         PlayCountEntity::class,
         RecognitionHistory::class,
         SpeedDialItem::class,
-        PodcastEntity::class
+        PodcastEntity::class,
     ],
     views = [
         SortedSongArtistMap::class,
         SortedSongAlbumMap::class,
         PlaylistSongMapPreview::class,
     ],
-    version = 35,
+    version = 36,
     exportSchema = true,
     autoMigrations = [
         AutoMigration(from = 2, to = 3),
@@ -151,6 +154,7 @@ class MusicDatabase(
         AutoMigration(from = 32, to = 33),
         AutoMigration(from = 33, to = 34),
         AutoMigration(from = 34, to = 35),
+        AutoMigration(from = 35, to = 36, spec = Migration35To36::class),
     ],
 )
 @TypeConverters(Converters::class)
@@ -164,34 +168,154 @@ abstract class InternalDatabase : RoomDatabase() {
         fun newInstance(context: Context): MusicDatabase =
             MusicDatabase(
                 delegate =
-                Room
-                    .databaseBuilder(context, InternalDatabase::class.java, DB_NAME)
-                    .addMigrations(
-                        MIGRATION_1_2,
-                        MIGRATION_21_24,
-                        MIGRATION_22_24,
-                        MIGRATION_24_25,
-                    )
-                    .fallbackToDestructiveMigration(dropAllTables = true)
-                    .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
-                    .setTransactionExecutor(java.util.concurrent.Executors.newFixedThreadPool(4))
-                    .setQueryExecutor(java.util.concurrent.Executors.newFixedThreadPool(4))
-                    .addCallback(object : RoomDatabase.Callback() {
-                        override fun onOpen(db: SupportSQLiteDatabase) {
-                            super.onOpen(db)
-                            try {
-                                db.query("PRAGMA busy_timeout = 60000").close()
-                                db.query("PRAGMA cache_size = -16000").close()
-                                db.query("PRAGMA wal_autocheckpoint = 1000").close()
-                                db.query("PRAGMA synchronous = NORMAL").close()
-                            } catch (e: Exception) {
-                                Timber.tag("MusicDatabase").e(e, "Failed to set PRAGMA settings")
-                            }
-                        }
-                    })
-                    .build(),
+                    Room
+                        .databaseBuilder(context, InternalDatabase::class.java, DB_NAME)
+                        .openHelperFactory(BackupBeforeMigrationFactory(context, DB_NAME))
+                        .addMigrations(
+                            MIGRATION_1_2,
+                            MIGRATION_21_24,
+                            MIGRATION_22_24,
+                            MIGRATION_24_25,
+                        ).fallbackToDestructiveMigration(dropAllTables = true)
+                        .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
+                        .setTransactionExecutor(
+                            java.util.concurrent.Executors
+                                .newFixedThreadPool(4),
+                        ).setQueryExecutor(
+                            java.util.concurrent.Executors
+                                .newFixedThreadPool(4),
+                        ).addCallback(
+                            object : RoomDatabase.Callback() {
+                                override fun onOpen(db: SupportSQLiteDatabase) {
+                                    super.onOpen(db)
+                                    try {
+                                        db.query("PRAGMA busy_timeout = 60000").close()
+                                        db.query("PRAGMA cache_size = -16000").close()
+                                        db.query("PRAGMA wal_autocheckpoint = 1000").close()
+                                        db.query("PRAGMA synchronous = NORMAL").close()
+                                    } catch (e: Exception) {
+                                        Timber.tag("MusicDatabase").e(e, "Failed to set PRAGMA settings")
+                                    }
+                                }
+
+                                override fun onDestructiveMigration(db: SupportSQLiteDatabase) {
+                                    super.onDestructiveMigration(db)
+                                    backupDatabase(context, DB_NAME)
+                                }
+                            },
+                        ).build(),
             )
     }
+}
+
+private fun backupDatabase(
+    context: Context,
+    dbName: String,
+): File? {
+    val dbFile = context.getDatabasePath(dbName)
+    if (!dbFile.exists()) return null
+
+    val timestamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
+    val backupDir = File(context.filesDir, "database_backups").apply { mkdirs() }
+    val backupBase = File(backupDir, "${dbName}_backup_$timestamp")
+
+    fun copyFile(
+        src: File,
+        dst: File,
+    ): Boolean =
+        try {
+            src.inputStream().use { input ->
+                dst.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            true
+        } catch (e: Exception) {
+            Timber.tag("DatabaseBackup").e(e, "Failed to copy ${src.name}")
+            false
+        }
+
+    val success = copyFile(dbFile, File("$backupBase.db"))
+    if (success) {
+        File("${dbFile.absolutePath}-wal").takeIf { it.exists() }?.let {
+            copyFile(it, File("$backupBase.db-wal"))
+        }
+        File("${dbFile.absolutePath}-shm").takeIf { it.exists() }?.let {
+            copyFile(it, File("$backupBase.db-shm"))
+        }
+        Timber.tag("DatabaseBackup").i("Backed up database to $backupBase.db")
+    }
+    return if (success) File("$backupBase.db") else null
+}
+
+private class BackupBeforeMigrationFactory(
+    private val context: Context,
+    private val dbName: String,
+    private val delegate: SupportSQLiteOpenHelper.Factory =
+        androidx.sqlite.db.framework
+            .FrameworkSQLiteOpenHelperFactory(),
+) : SupportSQLiteOpenHelper.Factory {
+    override fun create(configuration: SupportSQLiteOpenHelper.Configuration): SupportSQLiteOpenHelper {
+        val wrappedCallback = BackupCallback(context, configuration.callback, dbName)
+        val configClass = SupportSQLiteOpenHelper.Configuration::class.java
+        val constructor = configClass.constructors.first()
+        val wrappedConfig =
+            when (constructor.parameterCount) {
+                4 -> {
+                    constructor.newInstance(
+                        configuration.context,
+                        configuration.name,
+                        wrappedCallback,
+                        configuration.useNoBackupDirectory,
+                    )
+                }
+
+                5 -> {
+                    constructor.newInstance(
+                        configuration.context,
+                        configuration.name,
+                        wrappedCallback,
+                        configuration.useNoBackupDirectory,
+                        configClass.getField("allowDataLossOnRecovery").get(configuration),
+                    )
+                }
+
+                else -> {
+                    throw IllegalStateException("Unexpected Configuration constructor")
+                }
+            } as SupportSQLiteOpenHelper.Configuration
+        return delegate.create(wrappedConfig)
+    }
+}
+
+private class BackupCallback(
+    private val context: Context,
+    private val delegate: SupportSQLiteOpenHelper.Callback,
+    private val dbName: String,
+) : SupportSQLiteOpenHelper.Callback(delegate.version) {
+    override fun onCreate(db: SupportSQLiteDatabase) = delegate.onCreate(db)
+
+    override fun onUpgrade(
+        db: SupportSQLiteDatabase,
+        oldVersion: Int,
+        newVersion: Int,
+    ) {
+        Timber.tag("DatabaseBackup").i("Database upgrade $oldVersion -> $newVersion, backing up first")
+        backupDatabase(context, dbName)
+        delegate.onUpgrade(db, oldVersion, newVersion)
+    }
+
+    override fun onDowngrade(
+        db: SupportSQLiteDatabase,
+        oldVersion: Int,
+        newVersion: Int,
+    ) {
+        Timber.tag("DatabaseBackup").i("Database downgrade $oldVersion -> $newVersion, backing up first")
+        backupDatabase(context, dbName)
+        delegate.onDowngrade(db, oldVersion, newVersion)
+    }
+
+    override fun onOpen(db: SupportSQLiteDatabase) = delegate.onOpen(db)
 }
 
 // ===== Migrations =====
@@ -276,10 +400,16 @@ val MIGRATION_1_2 =
                             title = cursor.getString(1),
                             duration = cursor.getInt(3),
                             liked = cursor.getInt(4) == 1,
-                            createDate = Instant.ofEpochMilli(Date(cursor.getLong(8)).time)
-                                .atZone(ZoneOffset.UTC).toLocalDateTime(),
-                            modifyDate = Instant.ofEpochMilli(Date(cursor.getLong(9)).time)
-                                .atZone(ZoneOffset.UTC).toLocalDateTime(),
+                            createDate =
+                                Instant
+                                    .ofEpochMilli(Date(cursor.getLong(8)).time)
+                                    .atZone(ZoneOffset.UTC)
+                                    .toLocalDateTime(),
+                            modifyDate =
+                                Instant
+                                    .ofEpochMilli(Date(cursor.getLong(9)).time)
+                                    .atZone(ZoneOffset.UTC)
+                                    .toLocalDateTime(),
                         ),
                     )
                     songArtistMaps.add(
@@ -406,7 +536,7 @@ val MIGRATION_21_24 =
     object : Migration(21, 24) {
         override fun migrate(db: SupportSQLiteDatabase) {
             // Combine all changes from 21→22→23→24
-            
+
             // From 21→22: Add columns
             try {
                 db.execSQL("ALTER TABLE song ADD COLUMN libraryAddToken TEXT DEFAULT ''")
@@ -441,7 +571,7 @@ val MIGRATION_21_24 =
                     }
                 }
             }
-            
+
             if (!hasIsUploaded) {
                 db.execSQL("ALTER TABLE `song` ADD COLUMN `isUploaded` INTEGER NOT NULL DEFAULT 0")
             }
@@ -463,7 +593,7 @@ val MIGRATION_22_24 =
                     }
                 }
             }
-            
+
             if (!hasIsUploaded) {
                 db.execSQL("ALTER TABLE `song` ADD COLUMN `isUploaded` INTEGER NOT NULL DEFAULT 0")
             }
@@ -485,7 +615,7 @@ val MIGRATION_22_24 =
     RenameColumn(
         tableName = "song",
         fromColumnName = "download_state",
-        toColumnName = "downloadState"
+        toColumnName = "downloadState",
     ),
     RenameColumn(tableName = "song", fromColumnName = "create_date", toColumnName = "createDate"),
     RenameColumn(tableName = "song", fromColumnName = "modify_date", toColumnName = "modifyDate"),
@@ -495,7 +625,7 @@ class Migration5To6 : AutoMigrationSpec {
         db.query("SELECT id FROM playlist WHERE id NOT LIKE 'LP%'").use { cursor ->
             while (cursor.moveToNext()) {
                 db.execSQL(
-                    "UPDATE playlist SET browseId = '${cursor.getString(0)}' WHERE id = '${cursor.getString(0)}'"
+                    "UPDATE playlist SET browseId = '${cursor.getString(0)}' WHERE id = '${cursor.getString(0)}'",
                 )
             }
         }
@@ -507,7 +637,7 @@ class Migration6To7 : AutoMigrationSpec {
         db.query("SELECT id, createDate FROM song").use { cursor ->
             while (cursor.moveToNext()) {
                 db.execSQL(
-                    "UPDATE song SET inLibrary = ${cursor.getLong(1)} WHERE id = '${cursor.getString(0)}'"
+                    "UPDATE song SET inLibrary = ${cursor.getLong(1)} WHERE id = '${cursor.getString(0)}'",
                 )
             }
         }
@@ -547,13 +677,13 @@ class Migration11To12 : AutoMigrationSpec {
                     table = "album",
                     conflictAlgorithm = SQLiteDatabase.CONFLICT_IGNORE,
                     values =
-                    contentValuesOf(
-                        "id" to albumId,
-                        "title" to albumName,
-                        "songCount" to 0,
-                        "duration" to 0,
-                        "lastUpdateTime" to 0,
-                    ),
+                        contentValuesOf(
+                            "id" to albumId,
+                            "title" to albumName,
+                            "songCount" to 0,
+                            "duration" to 0,
+                            "lastUpdateTime" to 0,
+                        ),
                 )
             }
         }
@@ -571,7 +701,7 @@ class Migration13To14 : AutoMigrationSpec {
     override fun onPostMigrate(db: SupportSQLiteDatabase) {
         db.execSQL("UPDATE playlist SET createdAt = '${Converters().dateToTimestamp(LocalDateTime.now())}'")
         db.execSQL(
-            "UPDATE playlist SET lastUpdateTime = '${Converters().dateToTimestamp(LocalDateTime.now())}'"
+            "UPDATE playlist SET lastUpdateTime = '${Converters().dateToTimestamp(LocalDateTime.now())}'",
         )
     }
 }
@@ -604,8 +734,8 @@ class Migration19To20 : AutoMigrationSpec {
 @DeleteColumn.Entries(
     DeleteColumn(
         tableName = "song",
-        columnName = "artistName"
-    )
+        columnName = "artistName",
+    ),
 )
 class Migration20To21 : AutoMigrationSpec
 
@@ -640,7 +770,7 @@ class Migration22To23 : AutoMigrationSpec {
     }
 }
 
-class Migration23To24: AutoMigrationSpec {
+class Migration23To24 : AutoMigrationSpec {
     override fun onPostMigrate(db: SupportSQLiteDatabase) {
         var hasIsUploaded = false
         db.query("PRAGMA table_info('song')").use { cursor ->
@@ -714,6 +844,34 @@ class Migration29To30 : AutoMigrationSpec {
         }
         if (!hasProvider) {
             db.execSQL("ALTER TABLE lyrics ADD COLUMN provider TEXT NOT NULL DEFAULT 'Unknown'")
+        }
+    }
+}
+
+class Migration35To36 : AutoMigrationSpec {
+    override fun onPostMigrate(db: SupportSQLiteDatabase) {
+        var hasIsCached = false
+        var hasPlaybackPosition = false
+        var hasUploadEntityId = false
+        db.query("PRAGMA table_info('song')").use { cursor ->
+            val nameIndex = cursor.getColumnIndex("name")
+            while (cursor.moveToNext()) {
+                val colName = if (nameIndex >= 0) cursor.getString(nameIndex) else null
+                when (colName) {
+                    "isCached" -> hasIsCached = true
+                    "playbackPosition" -> hasPlaybackPosition = true
+                    "uploadEntityId" -> hasUploadEntityId = true
+                }
+            }
+        }
+        if (!hasPlaybackPosition) {
+            db.execSQL("ALTER TABLE song ADD COLUMN playbackPosition INTEGER DEFAULT NULL")
+        }
+        if (!hasUploadEntityId) {
+            db.execSQL("ALTER TABLE song ADD COLUMN uploadEntityId TEXT DEFAULT NULL")
+        }
+        if (!hasIsCached) {
+            db.execSQL("ALTER TABLE song ADD COLUMN isCached INTEGER NOT NULL DEFAULT 0")
         }
     }
 }
